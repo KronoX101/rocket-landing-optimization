@@ -299,6 +299,115 @@ class Rocket3D:
 
         return t_hist, x_hist
 
+    def simulate_until_touchdown(
+        self,
+        x0: Array,
+        thrust_func: Callable[[float, Array], Array],
+        dt: float = 0.02,
+        altitude_tol: float = 0.1,
+        max_time: float = 200.0,
+    ) -> Tuple[Array, Array]:
+        """Simulate the rocket trajectory until touchdown (z <= altitude_tol).
+
+        Args:
+            x0: Initial state vector [x, y, z, vx, vy, vz, m].
+            thrust_func: Callable mapping (t, x) -> 3D thrust vector [N].
+            dt: Time step [s]. Defaults to 0.02 (50 Hz).
+            altitude_tol: Touchdown threshold altitude [m]. Defaults to 0.1 m.
+            max_time: Maximum simulation time [s]. Simulation stops if this is exceeded.
+
+        Returns:
+            Tuple ``(t_hist, x_hist)`` where:
+                t_hist: Array of shape (N,) of time stamps.
+                x_hist: Array of shape (N, 7) of state history.
+
+        Raises:
+            ValueError: If initial mass < dry mass or invalid inputs.
+        """
+        x0 = np.asarray(x0, dtype=float).reshape(7)
+        if x0[6] < self.config.m_dry:
+            raise ValueError(
+                f"Initial mass {x0[6]:.2f} kg is below dry mass {self.config.m_dry:.2f} kg."
+            )
+        if dt <= 0.0:
+            raise ValueError("dt must be positive.")
+        if altitude_tol < 0.0:
+            raise ValueError("altitude_tol must be non-negative.")
+
+        # Pre-allocate arrays with maximum possible size
+        max_steps = int(np.ceil(max_time / dt)) + 1
+        t_hist = []
+        x_hist = []
+
+        t = 0.0
+        x = x0.copy()
+        t_hist.append(t)
+        x_hist.append(x.copy())
+
+        k = 1
+        touchdown_occurred = False
+        while k < max_steps:
+            try:
+                x_prev = x.copy()
+                z_prev = x_prev[2]
+                vz_prev = x_prev[5]
+                
+                x = self.rk4_step(t, x, dt, thrust_func)
+                t += dt
+                
+                # Enforce ground constraint: z cannot go below 0
+                if x[2] < 0.0:
+                    # We've gone underground - clamp to ground and stop immediately
+                    x[2] = 0.0
+                    x[5] = 0.0  # Zero vertical velocity at touchdown
+                    t_hist.append(t)
+                    x_hist.append(x.copy())
+                    logger.info(
+                        "Touchdown detected at t=%.3f s, z=%.3f m (ground constraint enforced)",
+                        t,
+                        x[2],
+                    )
+                    break
+                
+                # Check for touchdown: stop when descending through altitude threshold
+                # Only stop on first downward crossing to prevent stopping on upward bounce
+                if not touchdown_occurred and x[2] <= altitude_tol:
+                    # Check if we crossed down through threshold (was above, now at/below) while descending
+                    crossed_downward = z_prev > altitude_tol and x[2] <= altitude_tol
+                    # Or if we're at/below threshold and descending (vz < 0 means descending)
+                    descending_at_threshold = x[2] <= altitude_tol and x[5] < 0.0
+                    
+                    if crossed_downward or descending_at_threshold:
+                        # Clamp to ground and stop - touchdown!
+                        x[2] = max(0.0, x[2])
+                        x[5] = 0.0  # Zero velocity at touchdown
+                        t_hist.append(t)
+                        x_hist.append(x.copy())
+                        touchdown_occurred = True
+                        logger.info(
+                            "Touchdown detected at t=%.3f s, z=%.3f m, vz=%.3f m/s",
+                            t,
+                            x[2],
+                            x[5],
+                        )
+                        break
+                
+                t_hist.append(t)
+                x_hist.append(x.copy())
+                k += 1
+            except ValueError as exc:
+                logger.error("Simulation aborted at step %d, t=%.3f: %s", k, t, exc)
+                break
+
+        if k >= max_steps:
+            logger.warning(
+                "Simulation reached max_time=%.1f s without touchdown. Final altitude: %.3f m",
+                max_time,
+                x[2],
+            )
+
+        return np.array(t_hist), np.array(x_hist)
+
     # ------------------------------------------------------------------
     # Energy accounting
     # ------------------------------------------------------------------

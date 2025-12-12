@@ -46,19 +46,26 @@ def run_solvers(
     results: Dict[str, Dict[str, np.ndarray]] = {}
 
     if method in ("classical", "both"):
-        # Constant thrust via bisection
-        bis = classical.constant_thrust_bisection(t_final=40.0)
+        # Constant thrust via bisection - finds thrust that actually lands
+        bis = classical.constant_thrust_bisection()
         T_vec = np.array([0.0, 0.0, bis.T_opt])
-        from dynamics import constant_thrust_profile
-
-        thrust_const = constant_thrust_profile(T_vec)
-        t_c, x_c = rocket.simulate(x0, thrust_const, t_final=40.0, dt=0.02)
+        
+        # Get full landing trajectory
+        t_c, x_c = classical.find_landing_trajectory(bis.T_opt)
 
         # Compute thrust history
         T_hist = np.zeros((t_c.size, 3))
         T_hist[:] = T_vec[None, :]
 
-        results["classical"] = {"t": t_c, "x": x_c, "T": T_hist, "bisection_history": np.array(bis.history)}
+        # Convert history format for compatibility
+        bisection_history = np.array([(h[0], h[1], h[2]) for h in bis.history])
+
+        results["classical"] = {
+            "t": t_c,
+            "x": x_c,
+            "T": T_hist,
+            "bisection_history": bisection_history,
+        }
 
     if method in ("convex", "both"):
         # Convex SOCP
@@ -117,6 +124,11 @@ def main() -> None:
         help="If set, save 3D descent animation MP4.",
     )
     parser.add_argument(
+        "--bisection-animation",
+        action="store_true",
+        help="If set, generate bisection touchdown animation (runs until touchdown).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="outputs",
@@ -146,6 +158,10 @@ def main() -> None:
     if "convex" in results:
         o = results["convex"]
         vis.plot_3d_trajectory(o["t"], o["r"], T=o["T"], basename="trajectory_convex")
+        # Generate comprehensive convex optimization visualizations
+        vis.convex_optimization_dashboard(o, basename="convex_dashboard")
+        vis.convex_thrust_heatmap(o, basename="convex_thrust_heatmap")
+        vis.convex_phase_space(o, basename="convex_phase_space")
 
     if "classical" in results and "convex" in results:
         vis.comparison_dashboard(results["classical"], results["convex"])
@@ -156,7 +172,7 @@ def main() -> None:
 
     # Optional animations
     if args.save_animations:
-        # Classical-only animation (RK4 trajectory)
+        # Classical-only animation (Bisection method)
         if "classical" in results:
             c = results["classical"]
             r_c = c["x"][:, 0:3]
@@ -169,14 +185,40 @@ def main() -> None:
                 m_c,
                 T=c["T"],
                 basename="descent_classical",
+                title="Bisection Method",
             )
 
         # Convex-only animation and side-by-side comparison
         if "convex" in results:
             o = results["convex"]
-            vis.animate_descent(o["t"], o["r"], o["v"], o["m"], T=o["T"])
+            vis.animate_descent(o["t"], o["r"], o["v"], o["m"], T=o["T"], title="Convex Optimization (SOCP)")
             if "classical" in results:
                 vis.animate_comparison(results["classical"], results["convex"])
+
+    # Bisection touchdown animation (runs until touchdown)
+    if args.bisection_animation:
+        if "classical" in results:
+            rocket = Rocket3D()
+            c = results["classical"]
+            # Get the optimal thrust from bisection history
+            # The last entry in bisection_history has the final T_opt
+            bis_hist = c["bisection_history"]
+            T_opt = bis_hist[-1, 1]  # Second column is Tz
+            vis.animate_bisection_touchdown(
+                rocket,
+                T_opt,
+                basename="bisection_touchdown_animation",
+            )
+        else:
+            # Run bisection if not already done
+            rocket = Rocket3D()
+            classical = ClassicalSolver(rocket)
+            bis = classical.constant_thrust_bisection(t_final=40.0)
+            vis.animate_bisection_touchdown(
+                rocket,
+                bis.T_opt,
+                basename="bisection_touchdown_animation",
+            )
 
     # Run experiments if requested
     run_experiments(args.experiments == "all")

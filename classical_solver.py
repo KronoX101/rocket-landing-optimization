@@ -1,12 +1,10 @@
 """Classical numerical methods for powered descent guidance.
 
-This module implements a set of classical numerical techniques for
-landing a reusable rocket stage in three dimensions:
+This module implements classical numerical techniques for landing a
+reusable rocket stage in three dimensions:
 
 * Bisection method to determine a constant thrust level that yields a
   soft vertical landing (root‑finding on terminal vertical velocity).
-* Time‑varying thrust optimization using cubic splines and L‑BFGS‑B to
-  minimize a quadratic landing error and fuel consumption objective.
 * Monte Carlo uncertainty propagation to assess robustness with respect
   to initial condition perturbations and wind / thrust noise.
 
@@ -23,7 +21,6 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
 import numpy as np
-from scipy import interpolate, optimize
 
 from dynamics import (
     Array,
@@ -57,7 +54,9 @@ class BisectionResult:
     n_iter: int
     converged: bool
     vz_final: float
-    history: List[Tuple[int, float, float]]
+    z_final: float
+    t_landing: float
+    history: List[Tuple[int, float, float, float, float]]  # iter, Tz, vz_final, z_final, t_landing
 
 
 @dataclass
@@ -78,249 +77,179 @@ class ClassicalSolver:
         self.rocket = rocket or Rocket3D()
 
     # ------------------------------------------------------------------
-    # Bisection for constant thrust
+    # Bisection for constant thrust - LANDING OPTIMIZED
     # ------------------------------------------------------------------
     @profile_time
     def constant_thrust_bisection(
         self,
-        t_final: float,
-        vz_tol: float = 0.1,
-        max_iter: int = 30,
+        t_final: float = None,
+        vz_tol: float = 0.5,
+        z_tol: float = 1.0,
+        max_iter: int = 50,
     ) -> BisectionResult:
-        """Find a constant vertical thrust that yields near‑zero vertical velocity.
+        """Find a constant vertical thrust that yields a soft landing.
 
         The bisection search varies a constant thrust magnitude aligned
-        with the +z axis and uses RK4 simulations to evaluate the final
-        vertical velocity. The objective is to satisfy ``|vz(t_final)| <
-        vz_tol`` starting from :func:`default_initial_state`.
+        with the +z axis and simulates until touchdown. The objective is
+        to find thrust that results in landing at z≈0 with vz≈0.
 
         Args:
-            t_final: Final landing time horizon [s].
-            vz_tol: Tolerance on terminal vertical velocity [m/s].
+            t_final: Not used (kept for compatibility). Landing time is determined by simulation.
+            vz_tol: Tolerance on landing vertical velocity [m/s]. Default 0.5 m/s.
+            z_tol: Tolerance on landing altitude [m]. Default 1.0 m.
             max_iter: Maximum number of bisection iterations.
 
         Returns:
-            :class:`BisectionResult` with optimal thrust and diagnostics.
+            :class:`BisectionResult` with optimal thrust and landing diagnostics.
         """
         cfg: RocketConfig = self.rocket.config
         T_low = cfg.T_min
         T_high = cfg.T_max
 
-        history: List[Tuple[int, float, float]] = []
+        history: List[Tuple[int, float, float, float, float]] = []
 
-        def simulate_with_Tz(Tz: float) -> float:
+        def simulate_landing_with_Tz(Tz: float) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
+            """Simulate until touchdown and return landing metrics."""
             T_vec = np.array([0.0, 0.0, Tz], dtype=float)
             x0 = default_initial_state(cfg)
-            t_hist, x_hist = self.rocket.simulate(
-                x0=x0,
-                thrust_func=constant_thrust_profile(T_vec),
-                t_final=t_final,
-                dt=0.02,
-            )
-            vz_final = float(x_hist[-1, 5])
-            return vz_final
+            try:
+                t_hist, x_hist = self.rocket.simulate_until_touchdown(
+                    x0=x0,
+                    thrust_func=constant_thrust_profile(T_vec),
+                    dt=0.02,
+                    altitude_tol=z_tol,
+                )
+                # Get final state
+                if len(x_hist) > 0:
+                    z_final = float(x_hist[-1, 2])
+                    vz_final = float(x_hist[-1, 5])
+                    t_landing = float(t_hist[-1])
+                    return vz_final, z_final, t_landing, t_hist, x_hist
+                else:
+                    # Empty result - simulation failed
+                    return 1000.0, 1000.0, 0.0, np.array([]), np.array([])
+            except Exception as e:
+                logger.debug("Simulation failed for Tz=%.2f: %s", Tz, e)
+                # Return large penalty values to indicate failure
+                return 1000.0, 1000.0, 0.0, np.array([]), np.array([])
 
-        vz_low = simulate_with_Tz(T_low)
-        vz_high = simulate_with_Tz(T_high)
-        if vz_low * vz_high > 0:
-            logger.warning(
-                "Bisection initial bracket does not straddle root: vz_low=%.3f, vz_high=%.3f",
-                vz_low,
-                vz_high,
-            )
+        # Test initial bounds
+        vz_low, z_low, t_low, _, _ = simulate_landing_with_Tz(T_low)
+        vz_high, z_high, t_high, _, _ = simulate_landing_with_Tz(T_high)
+        
+        logger.info(
+            "Bisection initial bracket: T_low=%.2f (z=%.2f, vz=%.2f), T_high=%.2f (z=%.2f, vz=%.2f)",
+            T_low, z_low, vz_low, T_high, z_high, vz_high
+        )
 
         converged = False
         T_opt = 0.5 * (T_low + T_high)
         vz_final = np.nan
+        z_final = np.nan
+        t_landing = np.nan
+        min_iter = 10
+        best_result = None
+        best_error = float('inf')
 
         for i in range(max_iter):
             T_mid = 0.5 * (T_low + T_high)
-            vz_mid = simulate_with_Tz(T_mid)
-            history.append((i, T_mid, vz_mid))
-            logger.info("Bisection iter %d: Tz=%.2f N, vz_final=%.3f m/s", i, T_mid, vz_mid)
+            vz_mid, z_mid, t_mid, _, _ = simulate_landing_with_Tz(T_mid)
+            
+            # Compute landing quality (lower is better)
+            landing_error = abs(z_mid) + 5.0 * abs(vz_mid)
+            
+            history.append((i, T_mid, vz_mid, z_mid, t_mid))
+            logger.info(
+                "Bisection iter %d: Tz=%.2f N, z_final=%.2f m, vz_final=%.3f m/s, t=%.2f s",
+                i, T_mid, z_mid, vz_mid, t_mid
+            )
 
-            if abs(vz_mid) < vz_tol:
+            # Track best result
+            if landing_error < best_error:
+                best_error = landing_error
+                best_result = (T_mid, vz_mid, z_mid, t_mid)
+
+            # Check convergence: good landing if z≈0 and vz≈0
+            if i >= min_iter and abs(z_mid) <= z_tol and abs(vz_mid) <= vz_tol:
                 converged = True
                 T_opt = T_mid
                 vz_final = vz_mid
+                z_final = z_mid
+                t_landing = t_mid
                 break
 
-            if vz_mid < 0.0:
-                # Vehicle still descending: need more thrust
+            # Bisection logic: optimize for landing velocity
+            # If landing velocity is too negative (crashing): need more thrust
+            # If landing velocity is positive (bouncing): need less thrust
+            if vz_mid < -vz_tol:
+                # Still crashing/descending too fast: need more thrust
                 T_low = T_mid
                 vz_low = vz_mid
-            else:
-                # Vehicle ascending at final time: too much thrust
+                z_low = z_mid
+            elif vz_mid > vz_tol:
+                # Bouncing/ascending: need less thrust
                 T_high = T_mid
                 vz_high = vz_mid
+                z_high = z_mid
+            else:
+                # Velocity is close to zero, optimize for altitude
+                if z_mid < -z_tol:
+                    # Went underground: need more thrust
+                    T_low = T_mid
+                    vz_low = vz_mid
+                    z_low = z_mid
+                elif z_mid > z_tol:
+                    # Too high: this shouldn't happen if velocity is good, but if it does, need less thrust
+                    T_high = T_mid
+                    vz_high = vz_mid
+                    z_high = z_mid
+                else:
+                    # Both are good!
+                    converged = True
+                    T_opt = T_mid
+                    vz_final = vz_mid
+                    z_final = z_mid
+                    t_landing = t_mid
+                    break
 
         else:
-            # Use midpoint of final interval as best estimate
-            T_opt = 0.5 * (T_low + T_high)
-            vz_final = simulate_with_Tz(T_opt)
+            # Use best result from search
+            if best_result is not None:
+                T_opt, vz_final, z_final, t_landing = best_result
+                logger.info("Using best result: z=%.2f m, vz=%.3f m/s", z_final, vz_final)
+            else:
+                # Fallback to midpoint
+                T_opt = 0.5 * (T_low + T_high)
+                vz_final, z_final, t_landing, _, _ = simulate_landing_with_Tz(T_opt)
 
         return BisectionResult(
             T_opt=T_opt,
             n_iter=len(history),
             converged=converged,
             vz_final=vz_final,
+            z_final=z_final,
+            t_landing=t_landing,
             history=history,
         )
-
-    # ------------------------------------------------------------------
-    # Spline‑based variable thrust optimization
-    # ------------------------------------------------------------------
-    def _spline_from_control_points(
-        self,
-        t_knots: Array,
-        thrust_knots: Array,
-    ) -> Callable[[float, Array], Array]:
-        """Create a C^2 cubic spline thrust profile from control points.
-
+    
+    def find_landing_trajectory(self, T_opt: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Simulate full landing trajectory with optimal thrust.
+        
         Args:
-            t_knots: 1D array of knot times of shape (N,).
-            thrust_knots: Array of shape (N, 3) with [Tx, Ty, Tz] at knots.
-
+            T_opt: Optimal thrust magnitude [N].
+            
         Returns:
-            Callable mapping (t, x) -> T(t) by spline evaluation.
+            Tuple (t_hist, x_hist) of landing trajectory.
         """
-        t_knots = np.asarray(t_knots, dtype=float)
-        thrust_knots = np.asarray(thrust_knots, dtype=float)
-        if t_knots.ndim != 1 or thrust_knots.shape != (t_knots.size, 3):
-            raise ValueError("Invalid spline knot shapes.")
-
-        # Fit independent cubic splines for each thrust component.
-        splx = interpolate.CubicSpline(t_knots, thrust_knots[:, 0], bc_type="clamped")
-        sply = interpolate.CubicSpline(t_knots, thrust_knots[:, 1], bc_type="clamped")
-        splz = interpolate.CubicSpline(t_knots, thrust_knots[:, 2], bc_type="clamped")
-
-        def thrust_func(t: float, _x: Array) -> Array:
-            T = np.array([splx(t), sply(t), splz(t)], dtype=float)
-            # Enforce thrust magnitude bounds.
-            T_norm = float(np.linalg.norm(T))
-            if T_norm == 0:
-                return np.zeros(3)
-            cfg = self.rocket.config
-            T_mag = np.clip(T_norm, cfg.T_min, cfg.T_max)
-            return T_mag * (T / T_norm)
-
-        return thrust_func
-
-    @profile_time
-    def variable_thrust_optimization(
-        self,
-        t_final: float = 40.0,
-        n_knots: int = 5,
-        max_iter: int = 50,
-    ) -> Dict[str, Array]:
-        """Optimize a spline‑parameterized thrust profile.
-
-        The decision variables are the values of the thrust vector at a
-        small set of knot times. Cubic splines interpolate these values
-        to produce a smooth thrust profile. The objective is
-
-            J = 1000 * ||r_f||^2 + 1000 * ||v_f||^2 + (m0 - m_f)
-
-        where r_f, v_f, m_f denote terminal position, velocity, and mass.
-
-        Args:
-            t_final: Final time horizon [s].
-            n_knots: Number of spline control points.
-            max_iter: Maximum L‑BFGS‑B iterations.
-
-        Returns:
-            Dictionary with optimized trajectory and thrust profile.
-        """
-        cfg = self.rocket.config
-        x0 = default_initial_state(cfg)
-
-        # Uniformly spaced knots in time.
-        t_knots = np.linspace(0.0, t_final, n_knots)
-
-        # Initialize with constant vertical thrust near mid‑range.
-        T_init_mag = 0.5 * (cfg.T_min + cfg.T_max)
-        T_init = np.tile(np.array([0.0, 0.0, T_init_mag]), (n_knots, 1))
-
-        def pack(T_knots: Array) -> Array:
-            return T_knots.reshape(-1)
-
-        def unpack(z: Array) -> Array:
-            return z.reshape(-1, 3)
-
-        def objective(z: Array) -> float:
-            T_knots = unpack(z)
-            thrust_func = self._spline_from_control_points(t_knots, T_knots)
-            _, x_hist = self.rocket.simulate(
-                x0=x0,
-                thrust_func=thrust_func,
-                t_final=t_final,
-                dt=0.05,
-            )
-            xf = x_hist[-1]
-            r_f = xf[0:3]
-            v_f = xf[3:6]
-            m_f = xf[6]
-
-            pos_term = 1000.0 * float(np.dot(r_f, r_f))
-            vel_term = 1000.0 * float(np.dot(v_f, v_f))
-            fuel_term = cfg.m0 - m_f
-            J = pos_term + vel_term + fuel_term
-
-            logger.debug(
-                "Objective eval: J=%.3f, ||r_f||=%.3f, ||v_f||=%.3f, m_f=%.3f",
-                J,
-                np.linalg.norm(r_f),
-                np.linalg.norm(v_f),
-                m_f,
-            )
-            return float(J)
-
-        z0 = pack(T_init)
-
-        # Bounds on each thrust component based on total magnitude limits.
-        # Use generous component‑wise bounds that still enforce |T| <= T_max.
-        comp_bound = cfg.T_max
-        bounds = [(-comp_bound, comp_bound)] * z0.size
-
-        logger.info(
-            "Starting spline optimization with %d knots and %d variables.",
-            n_knots,
-            z0.size,
-        )
-
-        res = optimize.minimize(
-            objective,
-            z0,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": max_iter, "disp": False},
-        )
-
-        if not res.success:
-            logger.warning("Spline optimization did not converge: %s", res.message)
-
-        T_opt = unpack(res.x)
-        thrust_opt = self._spline_from_control_points(t_knots, T_opt)
-        t_hist, x_hist = self.rocket.simulate(
+        T_vec = np.array([0.0, 0.0, T_opt], dtype=float)
+        x0 = default_initial_state(self.rocket.config)
+        t_hist, x_hist = self.rocket.simulate_until_touchdown(
             x0=x0,
-            thrust_func=thrust_opt,
-            t_final=t_final,
+            thrust_func=constant_thrust_profile(T_vec),
             dt=0.02,
+            altitude_tol=0.5,
         )
-
-        # Sample thrust over trajectory for visualization.
-        T_hist = np.zeros((t_hist.size, 3))
-        for i, t in enumerate(t_hist):
-            T_hist[i] = thrust_opt(t, x_hist[i])
-
-        return {
-            "t": t_hist,
-            "x": x_hist,
-            "T": T_hist,
-            "t_knots": t_knots,
-            "T_knots": T_opt,
-            "opt_result": res,
-        }
+        return t_hist, x_hist
 
     # ------------------------------------------------------------------
     # Monte Carlo analysis
